@@ -1,7 +1,4 @@
-"""Implements a fully blocking kernel client.
-
-Useful for test suites and blocking terminal interfaces.
-"""
+"""Implements an async kernel client"""
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 
@@ -12,9 +9,10 @@ import sys
 import time
 
 import zmq
+import zmq.asyncio
+import asyncio
 
-from time import monotonic
-from traitlets import Type
+from traitlets import (Type, Instance)
 from jupyter_client.channels import HBChannel
 from jupyter_client.client import KernelClient
 from .channels import ZMQSocketChannel
@@ -58,14 +56,51 @@ def reqrep(meth, channel='shell'):
     wrapped.__doc__ = '\n'.join(parts)
     return wrapped
 
-class BlockingKernelClient(KernelClient):
-    """A KernelClient with blocking APIs
+class AsyncKernelClient(KernelClient):
+    """A KernelClient with async APIs
 
     ``get_[channel]_msg()`` methods wait for and return messages on channels,
     raising :exc:`queue.Empty` if no message arrives within ``timeout`` seconds.
     """
 
-    def wait_for_ready(self, timeout=None):
+    # The PyZMQ Context to use for communication with the kernel.
+    context = Instance(zmq.asyncio.Context)
+    def _context_default(self):
+        return zmq.asyncio.Context()
+
+    #--------------------------------------------------------------------------
+    # Channel proxy methods
+    #--------------------------------------------------------------------------
+
+    async def get_shell_msg(self, *args, **kwargs):
+        """Get a message from the shell channel"""
+        return await self.shell_channel.get_msg(*args, **kwargs)
+
+    async def get_iopub_msg(self, *args, **kwargs):
+        """Get a message from the iopub channel"""
+        return await self.iopub_channel.get_msg(*args, **kwargs)
+
+    async def get_stdin_msg(self, *args, **kwargs):
+        """Get a message from the stdin channel"""
+        return await self.stdin_channel.get_msg(*args, **kwargs)
+
+    async def get_control_msg(self, *args, **kwargs):
+        """Get a message from the control channel"""
+        return await self.control_channel.get_msg(*args, **kwargs)
+
+    @property
+    def hb_channel(self):
+        """Get the hb channel object for this kernel."""
+        if self._hb_channel is None:
+            url = self._make_url('hb')
+            self.log.debug("connecting heartbeat channel to %s", url)
+            loop = asyncio.new_event_loop()
+            self._hb_channel = self.hb_channel_class(
+                self.context, self.session, url, loop
+            )
+        return self._hb_channel
+
+    async def wait_for_ready(self, timeout=None):
         """Waits for a response when a client is blocked
 
         - Sets future time for timeout
@@ -87,12 +122,12 @@ class BlockingKernelClient(KernelClient):
             while not self.is_alive():
                 if time.time() > abs_timeout:
                     raise RuntimeError("Kernel didn't respond to heartbeats in %d seconds and timed out" % timeout)
-                time.sleep(0.2)
+                await asyncio.sleep(0.2)
 
         # Wait for kernel info reply on shell channel
         while True:
             try:
-                msg = self.shell_channel.get_msg(block=True, timeout=1)
+                msg = await self.shell_channel.get_msg(timeout=1)
             except Empty:
                 pass
             else:
@@ -100,7 +135,7 @@ class BlockingKernelClient(KernelClient):
                     self._handle_kernel_info_reply(msg)
                     break
 
-            if not self.is_alive():
+            if not await self.is_alive():
                 raise RuntimeError('Kernel died before replying to kernel_info')
 
             # Check if current time is ready check time plus timeout
@@ -110,7 +145,7 @@ class BlockingKernelClient(KernelClient):
         # Flush IOPub channel
         while True:
             try:
-                msg = self.iopub_channel.get_msg(block=True, timeout=0.2)
+                msg = await self.iopub_channel.get_msg(timeout=0.2)
             except Empty:
                 break
 
@@ -122,18 +157,18 @@ class BlockingKernelClient(KernelClient):
     control_channel_class = Type(ZMQSocketChannel)
 
 
-    def _recv_reply(self, msg_id, timeout=None, channel='shell'):
+    async def _recv_reply(self, msg_id, timeout=None, channel='shell'):
         """Receive and return the reply for a given request"""
         if timeout is not None:
-            deadline = monotonic() + timeout
+            deadline = time.monotonic() + timeout
         while True:
             if timeout is not None:
-                timeout = max(0, deadline - monotonic())
+                timeout = max(0, deadline - time.monotonic())
             try:
                 if channel == 'control':
-                    reply = self.get_control_msg(timeout=timeout)
+                    reply = await self.get_control_msg(timeout=timeout)
                 else:
-                    reply = self.get_shell_msg(timeout=timeout)
+                    reply = await self.get_shell_msg(timeout=timeout)
             except Empty:
                 raise TimeoutError("Timeout waiting for reply")
             if reply['parent_header'].get('msg_id') != msg_id:
@@ -159,8 +194,6 @@ class BlockingKernelClient(KernelClient):
         content = msg['content']
         if content.get('password', False):
             prompt = getpass
-        elif sys.version_info < (3,):
-            prompt = raw_input
         else:
             prompt = input
 
@@ -201,7 +234,25 @@ class BlockingKernelClient(KernelClient):
         else:
             self._output_hook_default(msg)
 
-    def execute_interactive(self, code, silent=False, store_history=True,
+    async def is_alive(self):
+        """Is the kernel process still running?"""
+        from ..manager import KernelManager, AsyncKernelManager
+        if isinstance(self.parent, KernelManager):
+            # This KernelClient was created by a KernelManager,
+            # we can ask the parent KernelManager:
+            if isinstance(self.parent, AsyncKernelManager):
+                return await self.parent.is_alive()
+            return self.parent.is_alive()
+        if self._hb_channel is not None:
+            # We don't have access to the KernelManager,
+            # so we use the heartbeat.
+            return self._hb_channel.is_beating()
+        else:
+            # no heartbeat and not local, we can't tell if it's running,
+            # so naively return True
+            return True
+
+    async def execute_interactive(self, code, silent=False, store_history=True,
                  user_expressions=None, allow_stdin=None, stop_on_error=True,
                  timeout=None, output_hook=None, stdin_hook=None,
                 ):
@@ -212,8 +263,6 @@ class BlockingKernelClient(KernelClient):
 
         You can pass a custom output_hook callable that will be called
         with every IOPub message that is produced instead of the default redisplay.
-
-        .. versionadded:: 5.0
 
         Parameters
         ----------
@@ -265,7 +314,7 @@ class BlockingKernelClient(KernelClient):
             allow_stdin = self.allow_stdin
         if allow_stdin and not self.stdin_channel.is_alive():
             raise RuntimeError("stdin channel must be running to allow input")
-        msg_id = self.execute(code,
+        msg_id = await self.execute(code,
                               silent=silent,
                               store_history=store_history,
                               user_expressions=user_expressions,
@@ -293,7 +342,7 @@ class BlockingKernelClient(KernelClient):
 
         # set deadline based on timeout
         if timeout is not None:
-            deadline = monotonic() + timeout
+            deadline = time.monotonic() + timeout
         else:
             timeout_ms = None
 
@@ -309,19 +358,19 @@ class BlockingKernelClient(KernelClient):
         # wait for output and redisplay it
         while True:
             if timeout is not None:
-                timeout = max(0, deadline - monotonic())
+                timeout = max(0, deadline - time.monotonic())
                 timeout_ms = 1e3 * timeout
             events = dict(poller.poll(timeout_ms))
             if not events:
                 raise TimeoutError("Timeout waiting for output")
             if stdin_socket in events:
-                req = self.stdin_channel.get_msg(timeout=0)
+                req = await self.stdin_channel.get_msg(timeout=0)
                 stdin_hook(req)
                 continue
             if iopub_socket not in events:
                 continue
 
-            msg = self.iopub_channel.get_msg(timeout=0)
+            msg = await self.iopub_channel.get_msg(timeout=0)
 
             if msg['parent_header'].get('msg_id') != msg_id:
                 # not from my request
@@ -335,5 +384,5 @@ class BlockingKernelClient(KernelClient):
 
         # output is done, get the reply
         if timeout is not None:
-            timeout = max(0, deadline - monotonic())
-        return self._recv_reply(msg_id, timeout=timeout)
+            timeout = max(0, deadline - time.monotonic())
+        return await self._recv_reply(msg_id, timeout=timeout)

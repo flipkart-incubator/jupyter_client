@@ -48,15 +48,15 @@ kernel has dedicated sockets for the following functions:
    each frontend and the kernel.
 
 2. **IOPub**: this socket is the 'broadcast channel' where the kernel publishes all
-   side effects (stdout, stderr, etc.) as well as the requests coming from any
-   client over the shell socket and its own requests on the stdin socket.  There
-   are a number of actions in Python which generate side effects: :func:`print`
-   writes to ``sys.stdout``, errors generate tracebacks, etc.  Additionally, in
-   a multi-client scenario, we want all frontends to be able to know what each
-   other has sent to the kernel (this can be useful in collaborative scenarios,
-   for example).  This socket allows both side effects and the information
-   about communications taking place with one client over the shell channel
-   to be made available to all clients in a uniform manner.
+   side effects (stdout, stderr, debugging events etc.) as well as the requests
+   coming from any client over the shell socket and its own requests on the
+   stdin socket.  There are a number of actions in Python which generate side
+   effects: :func:`print` writes to ``sys.stdout``, errors generate tracebacks,
+   etc.  Additionally, in a multi-client scenario, we want all frontends to be
+   able to know what each other has sent to the kernel (this can be useful in
+   collaborative scenarios, for example).  This socket allows both side effects
+   and the information about communications taking place with one client over
+   the shell channel to be made available to all clients in a uniform manner.
 
 3. **stdin**: this ROUTER socket is connected to all frontends, and it allows
    the kernel to request input from the active frontend when :func:`raw_input` is called.
@@ -72,8 +72,9 @@ kernel has dedicated sockets for the following functions:
    which ones are from other clients, so they can display each type
    appropriately.
 
-4. **Control**: This channel is identical to Shell, but operates on a separate socket,
-   to allow important messages to avoid queueing behind execution requests (e.g. shutdown or abort).
+4. **Control**: This channel is identical to Shell, but operates on a separate
+   socket to avoid queueing behind execution requests. The control channel is 
+   used for shutdown and restart messages, as well as for debugging messages.
 
 5. **Heartbeat**: This socket allows for simple bytestring messages to be sent
    between the frontend and the kernel to ensure that they are still connected.
@@ -85,46 +86,55 @@ are reasonably representable in JSON.
 General Message Format
 ======================
 
-A message is defined by the following four-dictionary structure::
+A message is composed of five dictionaries.
+
+Message Header
+--------------
+
+The message `header` contains information about the message,
+such as unique identifiers for the originating session and the actual message id,
+the type of message, the version of the Jupyter protocol,
+and the date the message was created.
+In addition, there is a username field, e.g. for the process that generated the message, if applicable.
+This can be useful in collaborative settings where multiple users may be interacting with the same kernel simultaneously,
+so that frontends can label the various messages in a meaningful way.
+
+.. sourcecode:: python
 
     {
-      # The message header contains a pair of unique identifiers for the
-      # originating session and the actual message id, in addition to the
-      # username for the process that generated the message.  This is useful in
-      # collaborative settings where multiple users may be interacting with the
-      # same kernel simultaneously, so that frontends can label the various
-      # messages in a meaningful way.
-      'header' : {
-                    'msg_id' : str, # typically UUID, must be unique per message
-                    'username' : str,
-                    'session' : str, # typically UUID, should be unique per session
-                    # ISO 8601 timestamp for when the message is created
-                    'date': str,
-                    # All recognized message type strings are listed below.
-                    'msg_type' : str,
-                    # the message protocol version
-                    'version' : '5.0',
-         },
-
-      # In a chain of messages, the header from the parent is copied so that
-      # clients can track where messages come from.
-      'parent_header' : dict,
-
-      # Any metadata associated with the message.
-      'metadata' : dict,
-
-      # The actual content of the message must be a dict, whose structure
-      # depends on the message type.
-      'content' : dict,
-
-      # optional: buffers is a list of binary data buffers for implementations
-      # that support binary extensions to the protocol.
-      'buffers': list,
+        'msg_id' : str, # typically UUID, must be unique per message
+        'session' : str, # typically UUID, should be unique per session
+        'username' : str,
+        # ISO 8601 timestamp for when the message is created
+        'date': str,
+        # All recognized message type strings are listed below.
+        'msg_type' : str,
+        # the message protocol version
+        'version' : '5.0',
     }
+
+.. note::
+
+    The ``session`` id in a message header identifies a unique entity with state,
+    such as a kernel process or client process.
+
+    A client session id, in message headers from a client, should be unique among
+    all clients connected to a kernel. When a client reconnects to a kernel, it
+    should use the same client session id in its message headers. When a client
+    restarts, it should generate a new client session id.
+
+    A kernel session id, in message headers from a kernel, should identify a
+    particular kernel process. If a kernel is restarted, the kernel session id
+    should be regenerated.
+
+    The session id in a message header can be used to identify the sending entity.
+    For example, if a client disconnects and reconnects to a kernel, and messages
+    from the kernel have a different kernel session id than prior to the disconnect,
+    the client should assume that the kernel was restarted.
 
 .. versionchanged:: 5.0
 
-   ``version`` key added to the header.
+    ``version`` key added to the header.
 
 .. versionchanged:: 5.1
 
@@ -133,14 +143,87 @@ A message is defined by the following four-dictionary structure::
     so implementers are strongly encouraged to include it.
     It will be mandatory in 5.1.
 
+Parent header
+-------------
+
+When a message is the "result" of another message,
+such as a side-effect (output or status) or direct reply,
+the ``parent_header`` is a copy of the ``header`` of the message
+that "caused" the current message.
+``_reply`` messages MUST have a ``parent_header``,
+and side-effects *typically* have a parent.
+If there is no parent, an empty dict should be used.
+This parent is used by clients to route message handling to the right place,
+such as outputs to a cell.
+
+.. sourcecode::
+
+    {
+        # parent_header is a copy of the request's header
+        'msg_id': '...',
+        ...
+    }
+
+Metadata
+--------
+
+The `metadata` dict contains information about the message that is not part of the content.
+This is not often used, but can be an extra location to store information about requests and replies,
+such as extensions adding information about request or execution context.
+
+Content
+-------
+
+The ``content`` dict is the body of the message.
+Its structure is dictated by the ``msg_type`` field in the header,
+described in detail for each message below.
+
+Buffers
+-------
+
+Finally, a list of additional binary buffers can be associated with a message.
+While this is part of the protocol,
+no official messages make use of these buffers.
+They are used by extension messages, such as IPython Parallel's ``apply``
+and some of ipywidgets' ``comm`` messages.
+
+A full message
+--------------
+
+Combining all of these together,
+a complete message can be represented as the following dictionary of dictionaries (and one list)::
+
+    {
+        "header" : {
+            "msg_id": "...",
+            "msg_type": "...",
+            ...
+        },
+        "parent_header": {},
+        "metadata": {},
+        "content": {},
+        "buffers": [],
+    }
+
+
+.. note::
+
+    This dictionary structure is *not* part of the Jupyter protocol
+    that must be implemented by kernels and frontends;
+    that would be :ref:`wire_protocol`,
+    which dictates how this information is serialized over the wire.
+    Deserialization is up to the Kernel or frontend implementation,
+    but a dict like this would be a logical choice in most contexts.
+
 .. _msging_compatibility:
 
 Compatibility
 =============
 
 Kernels must implement the :ref:`execute <execute>` and :ref:`kernel info
-<msging_kernel_info>` messages in order to be usable. All other message types
-are optional, although we recommend implementing :ref:`completion
+<msging_kernel_info>` messages, along with the associated busy and idle
+:ref:`status` messages. All other message types are
+optional, although we recommend implementing :ref:`completion
 <msging_completion>` if possible. Kernels do not need to send any reply for
 messages they don't handle, and frontends should provide sensible behaviour if
 no reply arrives (except for the required execution and kernel info messages).
@@ -161,14 +244,17 @@ The Wire Protocol
 =================
 
 
-This message format exists at a high level,
+The above message format is only a logical representation of the contents of Jupyter messages,
 but does not describe the actual *implementation* at the wire level in zeromq.
-The canonical implementation of the message spec is our :class:`~jupyter_client.session.Session` class.
+This section describes the protocol that must be implemented by Jupyter kernels and clients
+talking to each other over zeromq.
+
+The reference implementation of the message spec is our :class:`~jupyter_client.session.Session` class.
 
 .. note::
 
     This section should only be relevant to non-Python consumers of the protocol.
-    Python consumers should simply import and the use implementation of the wire
+    Python consumers should import and the use implementation of the wire
     protocol in :class:`jupyter_client.session.Session`.
 
 Every message is serialized to a sequence of at least six blobs of bytes:
@@ -247,7 +333,7 @@ which can be used in custom messages, such as comms and extensions to the protoc
 Python API
 ==========
 
-As messages are dicts, they map naturally to a ``func(**kw)`` call form.  We
+As messages can be represented as dicts, they map naturally to a ``func(**kw)`` call form.  We
 should develop, at a few key points, functional forms of all the requests that
 take arguments in this manner and automatically construct the necessary dict
 for sending.
@@ -264,9 +350,10 @@ messages upon deserialization to the following form for convenience::
       'parent_header' : dict,
       'content' : dict,
       'metadata' : dict,
+      'buffers': list,
     }
 
-All messages sent to or received by any IPython process should have this
+All messages sent to or received by any IPython message handler should have this
 extended structure.
 
 
@@ -304,6 +391,9 @@ All reply messages have a ``'status'`` field, which will have one of the followi
 - ``status='abort'``: This is the same as ``status='error'``
   but with no information about the error.
   No fields should be present other that `status`.
+
+As a special case, ``execute_reply`` messages (see :ref:`execution_results`)
+have an ``execution_count`` field regardless of their status.
 
 .. versionchanged:: 5.1
 
@@ -415,7 +505,7 @@ Execution results
 Message type: ``execute_reply``::
 
     content = {
-      # One of: 'ok' OR 'error' OR 'abort'
+      # One of: 'ok' OR 'error' OR 'aborted'
       'status' : str,
 
       # The global kernel counter that increases by one with each request that
@@ -614,6 +704,11 @@ Message type: ``complete_request``::
 Message type: ``complete_reply``::
 
     content = {
+    # status should be 'ok' unless an exception was raised during the request,
+    # in which case it should be 'error', along with the usual error message content
+    # in other messages.
+    'status' : 'ok'
+
     # The list of all matches to the completion request, such as
     # ['a.isalnum', 'a.isalpha'] for the above example.
     'matches' : list,
@@ -625,11 +720,6 @@ Message type: ``complete_reply``::
 
     # Information that frontend plugins might use for extra display information about completions.
     'metadata' : dict,
-
-    # status should be 'ok' unless an exception was raised during the request,
-    # in which case it should be 'error', along with the usual error message content
-    # in other messages.
-    'status' : 'ok'
     }
 
 .. versionchanged:: 5.0
@@ -814,8 +904,6 @@ Message type: ``comm_info_reply``::
 
 .. versionadded:: 5.1
 
-    ``comm_info`` is a proposed addition for msgspec v5.1.
-
 .. _msging_kernel_info:
 
 Kernel info
@@ -835,6 +923,9 @@ Message type: ``kernel_info_request``::
 Message type: ``kernel_info_reply``::
 
     content = {
+        # 'ok' if the request succeeded or 'error', with error information as in all other replies.
+        'status' : 'ok',
+
         # Version of messaging protocol.
         # The first integer indicates major version.  It is incremented when
         # there is any backward incompatible change.
@@ -917,6 +1008,9 @@ and `codemirror modes <http://codemirror.net/mode/index.html>`_ for those fields
 
     ``language`` moved to ``language_info.name``
 
+Messages on the Control (ROUTER/DEALER) channel
+===============================================
+
 .. _msging_shutdown:
 
 Kernel shutdown
@@ -934,8 +1028,7 @@ multiple cases:
 
 The client sends a shutdown request to the kernel, and once it receives the
 reply message (which is otherwise empty), it can assume that the kernel has
-completed shutdown safely.  The request can be sent on either the `control` or
-`shell` channels.
+completed shutdown safely.  The request is sent on the `control` channel.
 
 Upon their own shutdown, client applications will typically execute a last
 minute sanity check and forcefully terminate any kernel that is still alive, to
@@ -959,6 +1052,10 @@ Message type: ``shutdown_reply``::
    socket, they simply send a forceful process termination signal, since a dead
    process is unlikely to respond in any useful way to messages.
 
+.. versionchanged:: 5.4
+
+    Sending a ``shutdown_request`` message on the ``shell`` channel is deprecated.
+
 .. _msging_interrupt:
 
 Kernel interrupt
@@ -980,11 +1077,31 @@ Message type: ``interrupt_reply``::
 
 .. versionadded:: 5.3
 
+Debug request
+-------------
+
+This message type is used with debugging kernels to request specific actions
+to be performed by the debugger such as adding a breakpoint or stepping into
+a code.
+
+Message type: ``debug_request``::
+
+    content = {}
+
+Message type: ``debug_reply``::
+
+    content = {}
+
+The ``content`` dict can be any JSON information used by debugging frontends
+and kernels.
+
+Debug requests and replies are sent over the `control` channel to prevent queuing
+behind execution requests.
+
+.. versionadded:: 5.5
 
 Messages on the IOPub (PUB/SUB) channel
 =======================================
-
-
 
 Streams (stdout,  stderr, etc)
 ------------------------------
@@ -1184,12 +1301,14 @@ Message type: ``error``::
 
     content = {
        # Similar content to the execute_reply messages for the 'error' case,
-       # except the 'status' field is omitted.
+       # except the 'status' and 'execution_count' fields are omitted.
     }
 
 .. versionchanged:: 5.0
 
     ``pyerr`` renamed to ``error``
+
+.. _status:
 
 Kernel status
 -------------
@@ -1229,14 +1348,6 @@ between the busy and idle status messages associated with a given request.
     Busy and idle messages should be sent before/after handling every request,
     not just execution.
 
-.. note::
-
-    Extra status messages are added between the notebook webserver and websocket clients
-    that are not sent by the kernel. These are:
-
-    - restarting (kernel has died, but will be automatically restarted)
-    - dead (kernel has died, restarting has failed)
-
 Clear output
 ------------
 
@@ -1258,6 +1369,22 @@ Message type: ``clear_output``::
     and ``wait`` is added.
     The selective clearing keys are ignored in v4 and the default behavior remains the same,
     so v4 clear_output messages will be safely handled by a v4.1 frontend.
+
+.. _debug_event:
+
+Debug event
+-----------
+
+This message type is used by debugging kernels to send debugging events to the
+frontend.
+
+Message type: ``debug_event``::
+
+    content = {}
+
+The ``content`` dict can be any JSON information used by debugging frontends.
+
+.. versionadded:: 5.5
 
 .. _stdin_messages:
 
@@ -1330,7 +1457,6 @@ Heartbeat for kernels
 Clients send ping messages on a REQ socket, which are echoed right back
 from the Kernel's REP socket. These are simple bytestrings, not full JSON messages described above.
 
-
 Custom Messages
 ===============
 
@@ -1342,8 +1468,7 @@ To do this, IPython adds a notion of a ``Comm``, which exists on both sides,
 and can communicate in either direction.
 
 These messages are fully symmetrical - both the Kernel and the Frontend can send each message,
-and no messages expect a reply.
-The Kernel listens for these messages on the Shell channel,
+and no messages expect a reply. The Kernel listens for these messages on the Shell channel,
 and the Frontend listens for them on the IOPub channel.
 
 Opening a Comm
@@ -1432,17 +1557,18 @@ Frontends claiming to implement protocol 5.2 **MUST** identify cursor_pos as the
 Kernels may choose to expect the UTF-16 offset from requests implementing protocol 5.1 and earlier, in order to behave correctly with the most popular frontends.
 But they should know that doing so *introduces* the inverse bug for the frontends that do not have this bug.
 
+As an example, use a python3 kernel and evaluate ``𨭎𨭎𨭎𨭎𨭎 = 10``.  Then type ``𨭎𨭎`` followed by the tab key and see if it properly completes.
+
 Known affected frontends (as of 2017-06):
 
 - Jupyter Notebook < 5.1
 - JupyterLab < 0.24
 - nteract < 0.2.0
-- CoCalc
 - Jupyter Console and QtConsole with Python 2 on macOS and Windows
 
 Known *not* affected frontends:
 
-- QtConsole, Jupyter Console with Python 3 or Python 2 on Linux
+- QtConsole, Jupyter Console with Python 3 or Python 2 on Linux, CoCalc
 
 .. seealso::
 

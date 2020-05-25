@@ -4,6 +4,63 @@
 Changes in Jupyter Client
 =========================
 
+6.1.3
+=====
+
+- Add AsyncKernelClient client_class to AsyncKernelManager (:ghpull:`542`)
+- Doc fix for xeus hyperlinks (:ghpull:`540`)
+- Doc typo fix (:ghpull:`539`)
+
+6.1.2
+=====
+- Fixed a bug causing clients to sometimes hang after a stop call was made (:ghpull:`536`)
+
+6.1.1
+=====
+
+- Subprocess kill action fix for async execution (:ghpull:`535`)
+- Doc fix for xeus kernel list (:ghpull:`534`)
+
+6.1.0
+=====
+
+This release includes support for asyncio patterns! Downstream tools should soon have releases to additionally support async patterns.
+
+- AsyncKernelManager and AsyncMultiKernelManager are now available for async jupyter_client interactions (:ghpull:`528`, :ghpull:`529`)
+- Removed unused sphinx dependency (:ghpull:`518`, :ghpull:`518`).
+- Added install instructions for pip to documentation (:ghpull:`521`)
+- Improved docs around version protocol and messaging (:ghpull:`522`, :ghpull:`526`)
+
+6.0.0
+=====
+
+The git history had to be reworked heavily in merging 5.x and master, so a link to all the changes at once in github had been left out as it's just confusing.
+
+An exciting change in this release is some async support (huge thanks to @davidbrochart for doing most of the work)! See linked PR below for more details, we're working on integrating this into nbclient as well in the near future.
+
+New Features:
+
+- Added async API (:ghpull:`506`)
+
+Changes:
+
+- Python 3.8 testing and support added (:ghpull:`509`)
+- Session.msg_id optimization (:ghpull:`493`)
+- Only cache ports if the cache_ports flag is set to True (:ghpull:`492`)
+- Removed direct dependency on pywin32 as this is now in jupyter core (:ghpull:`489`)
+
+Fixes:
+
+- Prevent two kernels to have the same ports (:ghpull:`490`)
+
+Docs:
+
+- Document the handling of error in do_execute (:ghpull:`500`)
+
+Breaking changes:
+
+- Dropped support for Python 2.7!
+
 5.3.4
 =====
 
